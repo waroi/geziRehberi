@@ -199,3 +199,207 @@ export const getWeatherByCityName = async (cityName) => {
     throw error;
   }
 };
+
+// Serbest metin ile seyahat planı oluşturma
+export const getTravelPlan = async (freeTextQuery) => {
+  try {
+    const response = await axios.post(
+      OPENAI_API_URL,
+      {
+        model: "gpt-3.5-turbo",
+        messages: [
+          {
+            role: "system",
+            content: "Sen uzman bir seyahat danışmanısın. Kullanıcının seyahat isteğini analiz ederek detaylı bir seyahat planı oluştur. Şehirler, konaklama önerileri, yemek önerileri, gezi rotası ve pratik tavsiyeler ver. Yanıtını organize bir şekilde kategorilere ayır."
+          },
+          {
+            role: "user",
+            content: freeTextQuery
+          }
+        ],
+        max_tokens: 1500,
+        temperature: 0.7
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const content = response.data.choices[0].message.content;
+    return parseTravelPlanFromResponse(content);
+  } catch (error) {
+    console.error('OpenAI Travel Plan API Error:', error);
+    throw new Error('Seyahat planı oluşturulurken bir hata oluştu. Lütfen daha sonra tekrar deneyin.');
+  }
+};
+
+// Seyahat planını parse etme
+const parseTravelPlanFromResponse = (content) => {
+  // İçeriği bölümlere ayırma
+  const sections = [];
+  const lines = content.split('\n');
+  
+  let currentSection = null;
+  
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    
+    // Başlık tespit et (##, **, büyük harf ile başlayan)
+    if (trimmedLine.match(/^#{1,3}\s*/) || 
+        trimmedLine.match(/^\*\*.*\*\*$/) ||
+        (trimmedLine.length > 0 && trimmedLine === trimmedLine.toUpperCase() && trimmedLine.length < 50)) {
+      
+      if (currentSection && currentSection.items.length > 0) {
+        sections.push(currentSection);
+      }
+      
+      const title = trimmedLine
+        .replace(/^#{1,3}\s*/, '')
+        .replace(/^\*\*/, '')
+        .replace(/\*\*$/, '')
+        .trim();
+        
+      currentSection = {
+        title: title || 'Genel Bilgiler',
+        items: []
+      };
+    } else if (trimmedLine && currentSection) {
+      // Liste öğesi veya paragraf
+      if (trimmedLine.match(/^[-*]\s*/) || trimmedLine.match(/^\d+\.\s*/)) {
+        const item = trimmedLine
+          .replace(/^[-*]\s*/, '')
+          .replace(/^\d+\.\s*/, '')
+          .trim();
+        currentSection.items.push(item);
+      } else if (trimmedLine.length > 10) {
+        currentSection.items.push(trimmedLine);
+      }
+    }
+  }
+  
+  if (currentSection && currentSection.items.length > 0) {
+    sections.push(currentSection);
+  }
+  
+  // Eğer bölümleme başarısız olduysa, basit yapı oluştur
+  if (sections.length === 0) {
+    sections.push({
+      title: 'Seyahat Planınız',
+      items: content.split('\n').filter(line => line.trim()).slice(0, 15)
+    });
+  }
+  
+  return sections;
+};
+
+// OpenStreetMap Nominatim API ile koordinat alma
+export const getCityCoordinates = async (cityName) => {
+  try {
+    const response = await axios.get(
+      `https://nominatim.openstreetmap.org/search`,
+      {
+        params: {
+          q: cityName,
+          format: 'json',
+          limit: 1,
+          addressdetails: 1
+        },
+        headers: {
+          'User-Agent': 'GeziRehberi/1.0'
+        }
+      }
+    );
+
+    if (response.data && response.data.length > 0) {
+      const location = response.data[0];
+      return {
+        lat: parseFloat(location.lat),
+        lon: parseFloat(location.lon),
+        displayName: location.display_name
+      };
+    } else {
+      throw new Error('Şehir koordinatları bulunamadı');
+    }
+  } catch (error) {
+    console.error('Nominatim API Error:', error);
+    throw new Error('Konum bilgisi alınırken bir hata oluştu.');
+  }
+};
+
+// Gezilecek yerlerin koordinatlarını alma (ChatGPT ile)
+export const getPlaceCoordinates = async (cityName, places) => {
+  try {
+    // Şehir koordinatını al
+    const cityCoords = await getCityCoordinates(cityName);
+    
+    // ChatGPT'den gezilecek yerlerin koordinatlarını iste
+    const placesText = places.map(place => place.name).join(', ');
+    
+    const response = await axios.post(
+      OPENAI_API_URL,
+      {
+        model: "gpt-3.5-turbo",
+        messages: [
+          {
+            role: "system",
+            content: "Sen bir coğrafya uzmanısın. Verilen şehirdeki gezilecek yerlerin yaklaşık koordinatlarını (enlem, boylam) ver. Sadece JSON formatında yanıtla. Her yer için: {'name': 'yer adı', 'lat': enlem, 'lng': boylam, 'description': 'kısa açıklama'}"
+          },
+          {
+            role: "user",
+            content: `${cityName} şehrindeki bu yerler için koordinatları ver: ${placesText}. JSON array formatında döndür.`
+          }
+        ],
+        max_tokens: 1000,
+        temperature: 0.3
+      },
+      {
+        headers: {
+          'Authorization': `Bearer ${OPENAI_API_KEY}`,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    const content = response.data.choices[0].message.content;
+    
+    try {
+      // JSON parse etmeye çalış
+      const coordinates = JSON.parse(content);
+      
+      // Şehir merkezi koordinatını da ekle
+      const allCoordinates = [
+        {
+          name: cityName + ' Merkezi',
+          lat: cityCoords.lat,
+          lng: cityCoords.lon,
+          description: 'Şehir merkezi',
+          isCenter: true
+        },
+        ...coordinates
+      ];
+      
+      return {
+        cityCoords,
+        placesWithCoords: allCoordinates
+      };
+    } catch (parseError) {
+      // JSON parse başarısız olduysa manuel koordinatlar oluştur
+      return {
+        cityCoords,
+        placesWithCoords: [{
+          name: cityName + ' Merkezi',
+          lat: cityCoords.lat,
+          lng: cityCoords.lon,
+          description: 'Şehir merkezi',
+          isCenter: true
+        }]
+      };
+    }
+  } catch (error) {
+    console.error('Place Coordinates API Error:', error);
+    throw new Error('Yer koordinatları alınırken bir hata oluştu.');
+  }
+};
